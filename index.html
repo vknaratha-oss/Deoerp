@@ -705,6 +705,7 @@ global.QRCode.CorrectLevel={L:1,M:0,Q:3,H:2};
         <div class="rni" onclick="nav('permissions')" data-page="permissions">🔐 Permission Management / สิทธิ์</div>
         <div class="rni" onclick="nav('actlog')" data-page="actlog">📋 Activity Log</div>
         <div class="rni" onclick="nav('users')" data-page="users">👤 User Management / ผู้ใช้</div>
+        <div class="rni" onclick="changeMyPassword()">🔑 เปลี่ยนรหัสผ่านของฉัน</div>
         <div class="rni" onclick="showCompanySettings()">🏭 ข้อมูลบริษัท / โลโก้</div>
         <div class="rni" onclick="deoSetup()">⚙️ ตั้งค่าบริษัท / การเชื่อมต่อ (Setup)</div>
       </div>
@@ -3451,7 +3452,20 @@ Object.keys(RM).forEach(r=>{ ['tasks','po'].forEach(p=>{ if(!RM[r].includes(p)) 
 // ══════════════════════════════════════════════════
 //  SUPABASE HELPERS
 // ════════════════════════════════════════════════════════════
-const H=()=>({'apikey':KEY,'Authorization':`Bearer ${KEY}`,'Content-Type':'application/json'});
+let SESSION_TOKEN=localStorage.getItem('erp_token')||'';
+const H=()=>{ const h={'apikey':KEY,'Authorization':`Bearer ${KEY}`,'Content-Type':'application/json'};
+  if(SESSION_TOKEN) h['x-app-token']=SESSION_TOKEN; return h; };
+// เรียกฟังก์ชันฝั่งฐานข้อมูล (RPC) — ใช้กับระบบ login/รหัสผ่าน
+async function sbRpc(fn, params){
+  const r=await axios.post(`${SB}/rest/v1/rpc/${fn}`, params||{}, {headers:H()});
+  return r.data;
+}
+// ตรวจว่าเซิร์ฟเวอร์ยังไม่ได้ติดตั้งฟังก์ชันความปลอดภัย (ยังไม่รัน SECURITY_1)
+function _rpcMissing(e){
+  const st=e&&e.response&&e.response.status;
+  const msg=((e&&e.response&&e.response.data&&(e.response.data.message||e.response.data.hint))||'')+'';
+  return st===404 || /PGRST202|could not find the function|does not exist/i.test(msg);
+}
 async function sbG(t,o={}){
   const{s='*',f=[],ord=null,lim=null}=o;
   let u=`${SB}/rest/v1/${t}?select=${s}`;
@@ -3483,16 +3497,36 @@ async function doLogin(){
   const btn=document.getElementById('lbtn'),err=document.getElementById('lerr');
   err.style.display='none';btn.textContent='⏳...';btn.disabled=true;
   try{
+    // ── ระบบใหม่: ตรวจรหัสผ่านที่ฐานข้อมูล (bcrypt) เบราว์เซอร์ไม่เห็น hash ──
+    let res=null;
+    try{ res=await sbRpc('app_login',{p_username:u,p_password:p}); }
+    catch(e){
+      if(!_rpcMissing(e)) throw e;
+      res=null; // ยังไม่ได้ติดตั้ง SECURITY_1 → ใช้วิธีเดิมชั่วคราว
+    }
+    if(res){
+      if(!res.ok){
+        const m={not_found:'ไม่พบ Username นี้ในระบบ',inactive:'บัญชีนี้ถูกระงับการใช้งาน',bad_password:'Password ไม่ถูกต้อง'};
+        showLE(m[res.reason]||('เข้าสู่ระบบไม่สำเร็จ: '+(res.reason||'')));
+        return;
+      }
+      SESSION_TOKEN=res.token||'';
+      try{ localStorage.setItem('erp_token',SESSION_TOKEN); }catch(_){}
+      CU=res.user; if(!CU.emp_code) CU.emp_code=CU.username;
+      await logA('LOGIN','auth','เข้าสู่ระบบ');
+      showApp();
+      return;
+    }
+    // ── โหมดเดิม (ก่อนติดตั้ง SECURITY_1) ──
     const us=await sbG('users',{f:[`username=eq.${u}`,`is_active=eq.true`]});
     if(!us.length){showLE('ไม่พบUsernameนี้ในระบบ');return;}
     if(!chkp(p,us[0].password_hash)){showLE('Passwordไม่ถูกต้อง');return;}
     CU=us[0];
-    // ถ้า CU ไม่มี emp_code → ใช้ username แทน (backward compat)
     if(!CU.emp_code) CU.emp_code = CU.username;
     await sbU('users',{last_login:new Date().toISOString()},`id=eq.${CU.id}`);
     await logA('LOGIN','auth','เข้าสู่ระบบ');
     showApp();
-  }catch(e){showLE('Error: '+e.message);}
+  }catch(e){showLE('Error: '+((e&&e.response&&e.response.data&&e.response.data.message)||e.message));}
   finally{btn.textContent='🔑 เข้าสู่ระบบ';btn.disabled=false;}
 }
 function showLE(m){const e=document.getElementById('lerr');e.textContent='❌ '+m;e.style.display='block';}
@@ -3513,7 +3547,11 @@ function authTouch(){
   _authTouchLast=now;
   try{ const s=JSON.parse(localStorage.getItem('erp_session')||'{}'); if(s&&s.user){ s.ts=now; localStorage.setItem('erp_session',JSON.stringify(s)); } }catch(e){}
 }
-function authClearSession(){ try{ localStorage.removeItem('erp_session'); }catch(e){} }
+function authClearSession(){
+  try{ localStorage.removeItem('erp_session'); }catch(e){}
+  try{ if(SESSION_TOKEN) sbRpc('app_logout',{p_token:SESSION_TOKEN}).catch(()=>{}); }catch(e){}
+  SESSION_TOKEN=''; try{ localStorage.removeItem('erp_token'); }catch(e){}
+}
 function authIdleCheck(){
   if(!CU) return;
   let ts=0; try{ ts=(JSON.parse(localStorage.getItem('erp_session')||'{}')||{}).ts||0; }catch(e){}
@@ -3538,12 +3576,25 @@ async function authRestore(){
   if(Date.now()-s.ts>AUTH_IDLE_MS){ authClearSession(); return false; }
   CU=s.user; if(!CU.emp_code) CU.emp_code=CU.username;
   showApp();   // เข้าแอปทันที (ไม่ต้องรอเครือข่าย)
-  // ตรวจสถานะผู้ใช้ใน background — ถ้าถูกปิดใช้งาน/ลบ ให้เด้งออก, ถ้า role เปลี่ยนให้รีเฟรชสิทธิ์
-  sbG('users',{f:['username=eq.'+encodeURIComponent(CU.username),'is_active=eq.true']}).then(us=>{
-    if(!us||!us.length){ authAutoLogout(); return; }
-    CU=us[0]; if(!CU.emp_code) CU.emp_code=CU.username; authSaveSession();
-    if(typeof applyPerms==='function') applyPerms();
-  }).catch(()=>{});
+  // ตรวจ session กับฐานข้อมูลใน background — หมดอายุ/ถูกปิดใช้งาน = เด้งออก
+  (async()=>{
+    try{
+      if(SESSION_TOKEN){
+        const r=await sbRpc('app_session_user',{p_token:SESSION_TOKEN});
+        if(!r||!r.ok){ authAutoLogout(); return; }
+        CU=r.user; if(!CU.emp_code) CU.emp_code=CU.username; authSaveSession();
+        if(typeof applyPerms==='function') applyPerms();
+        return;
+      }
+    }catch(e){ if(!_rpcMissing(e)){ return; } }
+    // โหมดเดิม (ยังไม่ติดตั้ง SECURITY_1)
+    try{
+      const us=await sbG('users',{f:['username=eq.'+encodeURIComponent(CU.username),'is_active=eq.true']});
+      if(!us||!us.length){ authAutoLogout(); return; }
+      CU=us[0]; if(!CU.emp_code) CU.emp_code=CU.username; authSaveSession();
+      if(typeof applyPerms==='function') applyPerms();
+    }catch(_){}
+  })();
   return true;
 }
 ['click','keydown','mousedown','touchstart','scroll'].forEach(ev=>
@@ -7922,6 +7973,11 @@ async function loadActLog(){
 let _usersCache=[], _userFilter='all';
 async function loadUsers(){
   if(CU?.role!=='admin'){document.getElementById('users-list').innerHTML='<div class="al ale">เฉพาะ Admin เท่านั้นครับ</div>';return;}
+  try{
+    const r=await sbRpc('app_admin_list_users',{p_token:SESSION_TOKEN});
+    if(r&&r.ok){ _usersCache=r.users||[]; renderUsers(); return; }
+    if(r&&r.reason==='forbidden'){ document.getElementById('users-list').innerHTML='<div class="al ale">Session หมดอายุ หรือไม่มีสิทธิ์ — กรุณา login ใหม่</div>'; return; }
+  }catch(e){ if(!_rpcMissing(e)){ document.getElementById('users-list').innerHTML='<div class="al ale">โหลดรายชื่อผู้ใช้ไม่สำเร็จ</div>'; return; } }
   _usersCache=await sbG('users',{ord:'id.asc'});
   renderUsers();
 }
@@ -7966,7 +8022,7 @@ function userForm(u={}){return`
     <div class="fgrp"><label class="flbl">Username</label><input type="text" class="fc2" id="uf-user" value="${u.username||''}" placeholder="เช่น production2" ${u.id?'readonly':''}></div>
     <div class="fgrp"><label class="flbl">ชื่อ-นามสกุล</label><input type="text" class="fc2" id="uf-name" value="${u.full_name||''}"></div>
     <div class="fgrp"><label class="flbl">Email</label><input type="email" class="fc2" id="uf-email" value="${u.email||''}"></div>
-    <div class="fgrp"><label class="flbl">Password ${u.id?'(เว้นว่างถ้าไม่เปลี่ยน)':''}</label><input type="password" class="fc2" id="uf-pass" placeholder="${u.id?'ใส่เฉพาะเมื่อเปลี่ยน':'อย่างน้อย 6 ตัว'}"></div>
+    <div class="fgrp"><label class="flbl">Password ${u.id?'(เว้นว่างถ้าไม่เปลี่ยน)':''}</label><input type="password" class="fc2" id="uf-pass" placeholder="${u.id?'ใส่เฉพาะเมื่อเปลี่ยน':'อย่างน้อย 8 ตัว'}"></div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
     <div class="fgrp">
@@ -8004,27 +8060,52 @@ async function saveUser(id){
   const pass=document.getElementById('uf-pass').value;
   const role=document.getElementById('uf-role').value;
   if(!username||!fullName){msgEl('uf-msg','กรุณากรอกข้อมูลให้ครบ','e');return;}
-  if(!id&&pass.length<6){msgEl('uf-msg','Passwordต้องมีอย่างน้อย 6 ตัว','e');return;}
+  if(!id&&pass.length<8){msgEl('uf-msg','Password ต้องมีอย่างน้อย 8 ตัว','e');return;}
   const empCode=document.getElementById('uf-empcode')?.value.trim()||'';
   const isActive=(document.getElementById('uf-active')?.value||'true')==='true';
   if(isProgUser(username) && !isProgSession()){ msgEl('uf-msg','⚠️ บัญชีนี้เป็นบัญชีผู้ดูแลระบบ ไม่สามารถแก้ไขได้','e'); return; }
   if(!isActive && username===CU?.username){ msgEl('uf-msg','⚠️ ปิดการใช้งานบัญชีตัวเองไม่ได้ครับ','e'); return; }
-  const d={username,full_name:fullName,email,role,emp_code:empCode||username,is_active:isActive};
-  if(pass)d.password_hash=btoa(pass);
+  if(pass && pass.length<8){ msgEl('uf-msg','รหัสผ่านต้องอย่างน้อย 8 ตัว','e'); return; }
   try{
-    if(id){await sbU('users',d,`id=eq.${id}`);await logA('UPDATE','users',`แก้ไข ${username} (${isActive?'Active':'Inactive'})`);}
-    else{await sbP('users',d);await logA('CREATE','users',`เพิ่ม ${username} (${isActive?'Active':'Inactive'})`);}
+    // ── ระบบใหม่: ให้ฐานข้อมูลแฮชรหัสผ่าน (bcrypt) ──
+    try{
+      const r=await sbRpc('app_admin_save_user',{p_token:SESSION_TOKEN,p_id:id||null,p_username:username,
+        p_full_name:fullName,p_email:email,p_role:role,p_emp_code:empCode||username,
+        p_is_active:isActive,p_password:pass||null});
+      if(!r.ok){
+        const m={forbidden:'ต้องเป็น Admin และ session ยังไม่หมดอายุ',duplicate:'มี username นี้อยู่แล้ว',
+                 password_required:'ผู้ใช้ใหม่ต้องกำหนดรหัสผ่านอย่างน้อย 8 ตัว',self_disable:'ปิดบัญชีตัวเองไม่ได้'};
+        msgEl('uf-msg','❌ '+(m[r.reason]||r.reason),'e'); return;
+      }
+      await logA(id?'UPDATE':'CREATE','users',`${id?'แก้ไข':'เพิ่ม'} ${username} (${isActive?'Active':'Inactive'})`);
+      msgEl('uf-msg','✅ บันทึก','s'); setTimeout(()=>{closeMo();loadUsers();},800); return;
+    }catch(e){ if(!_rpcMissing(e)) throw e; }
+    // ── โหมดเดิม (ยังไม่ติดตั้ง SECURITY_1) ──
+    const d={username,full_name:fullName,email,role,emp_code:empCode||username,is_active:isActive};
+    if(pass)d.password_hash=btoa(pass);
+    if(id){await sbU('users',d,`id=eq.${id}`);await logA('UPDATE','users',`แก้ไข ${username}`);}
+    else{await sbP('users',d);await logA('CREATE','users',`เพิ่ม ${username}`);}
     msgEl('uf-msg','✅ บันทึก','s');setTimeout(()=>{closeMo();loadUsers();},800);
-  }catch(e){msgEl('uf-msg','❌ '+e.message,'e');}
+  }catch(e){msgEl('uf-msg','❌ '+((e&&e.response&&e.response.data&&e.response.data.message)||e.message),'e');}
 }
-async function editUser(id){const r=(await sbG('users',{f:[`id=eq.${id}`]}))[0]; if(!r)return; if(isProgUser(r.username)&&!isProgSession()){alert('บัญชีนี้เป็นบัญชีผู้ดูแลระบบ ไม่สามารถแก้ไขได้');return;} openMo(`✏️ แก้ไขผู้ใช้: ${r.username}`,userForm(r));}
+async function editUser(id){let r=(_usersCache||[]).find(x=>x.id===id);
+  if(!r){ try{ r=(await sbG('users',{f:[`id=eq.${id}`]}))[0]; }catch(_){} }
+  if(!r)return; if(isProgUser(r.username)&&!isProgSession()){alert('บัญชีนี้เป็นบัญชีผู้ดูแลระบบ ไม่สามารถแก้ไขได้');return;} openMo(`✏️ แก้ไขผู้ใช้: ${r.username}`,userForm(r));}
 async function toggleUser(id,active){
   const u=(_usersCache||[]).find(x=>x.id===id)||{};
   if(isProgUser(u.username) && !isProgSession()){ alert('บัญชีนี้เป็นบัญชีผู้ดูแลระบบ ไม่สามารถปิด/แก้ไขได้'); return; }
   if(u.username===CU?.username){ alert('ปิดการใช้งานบัญชีตัวเองไม่ได้ครับ'); return; }
   if(!confirm(active?`ปิดการใช้งาน "${u.full_name||u.username}"?\n(จะ login ไม่ได้ แต่ข้อมูล/ประวัติยังอยู่)`:`เปิดการใช้งาน "${u.full_name||u.username}" ให้เข้าระบบได้?`)) return;
   try{
-    await sbU('users',{is_active:!active},`id=eq.${id}`);
+    try{
+      const r=await sbRpc('app_admin_save_user',{p_token:SESSION_TOKEN,p_id:id,p_username:u.username||'',
+        p_full_name:u.full_name||null,p_email:u.email||null,p_role:u.role||'',p_emp_code:u.emp_code||'',
+        p_is_active:!active,p_password:null});
+      if(!r.ok){ alert('ไม่สำเร็จ: '+(r.reason==='forbidden'?'ต้องเป็น Admin / session หมดอายุ':r.reason)); return; }
+    }catch(e){
+      if(!_rpcMissing(e)) throw e;
+      await sbU('users',{is_active:!active},`id=eq.${id}`);
+    }
     await logA('UPDATE','users',`${active?'ปิด':'เปิด'}การใช้งาน ${u.username||id}`);
     loadUsers();
   }catch(e){ alert('ไม่สำเร็จ: '+(e.message||e)); }
@@ -15663,72 +15744,40 @@ function deoSetup(){
     </div>`:''}
     <div id="deo-setup-msg" style="margin-top:8px"></div>`);
 }
-// เปลี่ยนรหัสผ่านบัญชีผู้ดูแลระบบ (ใช้ได้เฉพาะตอน login ด้วยบัญชีนี้)
-function progChangePassword(){
-  if(!isProgSession()){ alert('ใช้ได้เฉพาะบัญชีผู้ดูแลระบบ'); return; }
-  openMo('🔑 เปลี่ยนรหัสผ่านบัญชีผู้ดูแลระบบ', `
-    <div style="font-size:12px;color:#64748B;margin-bottom:8px">บัญชี: <b>@${CU.username}</b></div>
+// ── เปลี่ยนรหัสผ่านของตัวเอง (ทุกบัญชี) — ต้องยืนยันรหัสผ่านเดิม ──
+function progChangePassword(){ changeMyPassword(); }
+function changeMyPassword(){
+  if(!CU){ alert('กรุณาเข้าสู่ระบบก่อน'); return; }
+  openMo('🔑 เปลี่ยนรหัสผ่าน', `
+    <div style="font-size:12px;color:#64748B;margin-bottom:8px">บัญชี: <b>@${CU.username}</b> (${CU.full_name||''})</div>
+    <div class="fgrp"><label class="flbl">รหัสผ่านเดิม</label><input type="password" class="fc2" id="pcp-old"></div>
     <div class="fgrp"><label class="flbl">รหัสผ่านใหม่</label><input type="password" class="fc2" id="pcp-1" placeholder="อย่างน้อย 8 ตัว"></div>
-    <div class="fgrp"><label class="flbl">ยืนยันรหัสผ่านใหม่</label><input type="password" class="fc2" id="pcp-2"></div>
+    <div class="fgrp"><label class="flbl">ยืนยันรหัสผ่านใหม่</label><input type="password" class="fc2" id="pcp-2"
+      onkeydown="if(event.key==='Enter')progSavePassword()"></div>
     <button class="btn btnP" style="width:100%" onclick="progSavePassword()">💾 บันทึกรหัสผ่านใหม่</button>
-    <div id="pcp-msg" style="margin-top:8px"></div>`);
+    <div id="pcp-msg" style="margin-top:8px"></div>
+    <div style="font-size:11px;color:#94A3B8;margin-top:6px">รหัสผ่านถูกเข้ารหัสด้วย bcrypt ที่ฐานข้อมูล — ไม่มีใครดูย้อนกลับได้</div>`);
 }
 async function progSavePassword(){
+  const oldp=(document.getElementById('pcp-old')||{}).value||'';
   const a=document.getElementById('pcp-1').value, b=document.getElementById('pcp-2').value;
-  if(a.length<8){ msgEl('pcp-msg','⚠️ รหัสผ่านต้องอย่างน้อย 8 ตัว','e'); return; }
+  if(a.length<8){ msgEl('pcp-msg','⚠️ รหัสผ่านใหม่ต้องอย่างน้อย 8 ตัว','e'); return; }
   if(a!==b){ msgEl('pcp-msg','⚠️ รหัสผ่านสองช่องไม่ตรงกัน','e'); return; }
+  if(!oldp){ msgEl('pcp-msg','⚠️ กรอกรหัสผ่านเดิมด้วยครับ','e'); return; }
   msgEl('pcp-msg','<span class="spin"></span> บันทึก...','i');
   try{
+    try{
+      const r=await sbRpc('app_change_own_password',{p_token:SESSION_TOKEN,p_old:oldp,p_new:a});
+      if(!r.ok){
+        const m={expired:'Session หมดอายุ — กรุณา login ใหม่',bad_password:'รหัสผ่านเดิมไม่ถูกต้อง',too_short:'รหัสผ่านสั้นเกินไป'};
+        msgEl('pcp-msg','❌ '+(m[r.reason]||r.reason),'e'); return;
+      }
+      msgEl('pcp-msg','✅ เปลี่ยนรหัสผ่านแล้ว — ครั้งต่อไปใช้รหัสใหม่','s'); return;
+    }catch(e){ if(!_rpcMissing(e)) throw e; }
+    // โหมดเดิม (ยังไม่ติดตั้ง SECURITY_1)
     await sbU('users',{password_hash:btoa(a)},`id=eq.${CU.id}`);
-    msgEl('pcp-msg','✅ เปลี่ยนรหัสผ่านแล้ว — ครั้งต่อไปใช้รหัสใหม่','s');
-  }catch(e){ msgEl('pcp-msg','❌ '+(e.message||e),'e'); }
-}
-function _deoFormVals(){
-  const v=id=>((document.getElementById(id)||{}).value||'').trim();
-  return {url:v('deo-url'), key:v('deo-key'), name:v('deo-coname'), en:v('deo-coen'), addr:v('deo-coaddr'), logo:(typeof coLogo==='function'?coLogo():'')};
-}
-function deoMakeConfig(){
-  const f=_deoFormVals();
-  if(!f.url||!f.key){ msgEl('deo-setup-msg','⚠️ กรอก Supabase URL และ anon key ก่อนครับ','e'); return; }
-  const esc=x=>String(x||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r?\n/g,' ');
-  const txt =
-`// ═══════════════════════════════════════════════════════════
-//  DEOERP — config.js  (ตั้งค่าโดย admin ครั้งเดียว)
-//  อัปโหลดไฟล์นี้ไว้โฟลเดอร์เดียวกับ index.html
-//  ผู้ใช้ทุกคนจะเข้าใช้งานได้ทันที ไม่ต้องกรอก key เอง
-//  สร้างเมื่อ: ${new Date().toLocaleString('th-TH')}
-// ═══════════════════════════════════════════════════════════
-window.DEO_CONFIG = {
-  supabaseUrl:     '${esc(f.url)}',
-  supabaseAnonKey: '${esc(f.key)}',
-  companyName:     '${esc(f.name)}',
-  companyNameEN:   '${esc(f.en)}',
-  companyAddress:  '${esc(f.addr)}',
-  companyLogo:     '${f.logo||''}'
-};
-`;
-  try{
-    const blob=new Blob([txt],{type:'text/javascript;charset=utf-8'});
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob); a.download='config.js';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(()=>URL.revokeObjectURL(a.href),3000);
-    msgEl('deo-setup-msg','✅ ดาวน์โหลด config.js แล้ว — นำไปอัปโหลดไว้โฟลเดอร์เดียวกับ index.html บนเว็บ (GitHub Pages) เสร็จแล้วทุกคนเข้าใช้ได้เลย','s');
-  }catch(e){
-    openMo('📄 คัดลอกเนื้อหา config.js',`<div style="font-size:12px;color:#64748B;margin-bottom:6px">คัดลอกข้อความนี้ไปสร้างไฟล์ชื่อ <b>config.js</b> วางไว้คู่กับ index.html</div>
-      <textarea class="fc2" rows="12" style="font-family:monospace;font-size:11px">${txt.replace(/</g,'&lt;')}</textarea>`);
-  }
-}
-function deoSetupSave(){
-  const set=(k,id)=>{ const el=document.getElementById(id); const v=((el&&el.value)||'').trim(); if(v) localStorage.setItem(k,v); else localStorage.removeItem(k); };
-  set('co_name','deo-coname'); set('co_name_en','deo-coen'); set('co_address','deo-coaddr');
-  set('erp_sb_url','deo-url'); set('erp_sb_key','deo-key');
-  alert('บันทึกเฉพาะเครื่องนี้แล้ว กำลังโหลดใหม่...'); location.reload();
-}
-function deoSetupReset(){
-  if(!confirm('ล้างค่าที่ตั้งไว้เฉพาะเครื่องนี้? (จะกลับไปใช้ค่าจาก config.js)')) return;
-  ['co_name','co_name_en','co_address','erp_sb_url','erp_sb_key'].forEach(k=>localStorage.removeItem(k));
-  alert('ล้างแล้ว กำลังโหลดใหม่...'); location.reload();
+    msgEl('pcp-msg','✅ เปลี่ยนรหัสผ่านแล้ว (โหมดเดิม — แนะนำให้ติดตั้งระบบความปลอดภัยใหม่)','s');
+  }catch(e){ msgEl('pcp-msg','❌ '+((e&&e.response&&e.response.data&&e.response.data.message)||e.message),'e'); }
 }
 function saveKey(){
   const k=document.getElementById('lkey')?.value?.trim();
